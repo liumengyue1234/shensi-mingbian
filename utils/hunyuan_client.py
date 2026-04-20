@@ -1,82 +1,125 @@
 """
 腾讯混元大模型客户端封装
+Tencent Hunyuan LLM Client
 """
 import os
 import json
 import requests
-from typing import Generator
+from typing import List, Dict, Any, Optional, Generator
 
 
 class HunyuanClient:
-    """腾讯混元大模型 / 腾讯元器智能体客户端"""
+    """腾讯元器智能体 API 客户端"""
 
-    YUANQI_URL = "https://yuanqi.tencent.com/openapi/v1/agent/chat/completions"
+    API_URL = "https://yuanqi.tencent.com/openapi/v1/agent/chat/completions"
 
-    def __init__(self):
-        self.app_id = os.getenv("YUANQI_APP_ID", "")
-        self.app_key = os.getenv("YUANQI_APP_KEY", "")
+    def __init__(self, app_id: str, app_key: str):
+        self.app_id = app_id
+        self.app_key = app_key
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {app_key}",
+        }
 
     def chat(
         self,
-        message: str,
+        messages: List[Dict],
         user_id: str = "user_001",
-        history: list = None,
-        stream: bool = False
-    ) -> dict | Generator:
+        stream: bool = False,
+        custom_variables: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """
-        与腾讯元器智能体对话
-        :param message: 用户消息
-        :param user_id: 用户 ID
-        :param history: 历史消息列表
-        :param stream: 是否流式返回
-        """
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.app_key}"
-        }
-        messages = history or []
-        messages.append({
-            "role": "user",
-            "content": [{"type": "text", "text": message}]
-        })
+        与智能体对话（非流式）
 
-        payload = {
+        Args:
+            messages: 消息列表，格式 [{"role": "user", "content": [{"type": "text", "text": "..."}]}]
+            user_id: 用户标识
+            stream: 是否流式
+            custom_variables: 自定义参数（工作流场景）
+
+        Returns:
+            API 响应数据
+        """
+        payload: Dict[str, Any] = {
             "assistant_id": self.app_id,
             "user_id": user_id,
             "stream": stream,
-            "messages": messages
+            "messages": messages,
         }
+        if custom_variables:
+            payload["custom_variables"] = custom_variables
 
-        if stream:
-            return self._stream_chat(headers, payload)
-        else:
-            response = requests.post(
-                self.YUANQI_URL, headers=headers, json=payload, timeout=60
-            )
-            response.raise_for_status()
-            return response.json()
+        r = requests.post(self.API_URL, headers=self.headers, json=payload, timeout=60)
+        r.raise_for_status()
+        return r.json()
 
-    def _stream_chat(self, headers: dict, payload: dict) -> Generator:
-        """流式对话生成器"""
+    def chat_stream(
+        self,
+        messages: List[Dict],
+        user_id: str = "user_001",
+    ) -> Generator[str, None, None]:
+        """流式对话，逐步返回内容片段"""
+        payload = {
+            "assistant_id": self.app_id,
+            "user_id": user_id,
+            "stream": True,
+            "messages": messages,
+        }
         with requests.post(
-            self.YUANQI_URL, headers=headers, json=payload, stream=True, timeout=60
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    line = line.decode("utf-8")
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            yield json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
+            self.API_URL, headers=self.headers, json=payload, stream=True, timeout=60
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8")
+                if line_str.startswith("data:"):
+                    data_str = line_str[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        choices = data.get("choices", [])
+                        for choice in choices:
+                            delta = choice.get("delta", {})
+                            if delta.get("role") == "assistant":
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                    except json.JSONDecodeError:
+                        continue
 
-    def extract_content(self, response: dict) -> str:
-        """从响应中提取文本内容"""
+    def simple_query(self, text: str, user_id: str = "user_001") -> str:
+        """简单文本查询，返回助手回复文本"""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": text}]}
+        ]
+        resp = self.chat(messages, user_id=user_id)
         try:
-            return response["choices"][0]["message"]["content"]
+            return resp["choices"][0]["message"]["content"]
         except (KeyError, IndexError):
             return ""
+
+    @staticmethod
+    def build_messages(history: List[Dict], user_input: str) -> List[Dict]:
+        """
+        构建对话消息列表（支持多轮对话历史）
+
+        Args:
+            history: 历史消息 [{"role": "user/assistant", "text": "..."}]
+            user_input: 当前用户输入
+
+        Returns:
+            符合API格式的messages列表
+        """
+        messages = []
+        for item in history:
+            messages.append({
+                "role": item["role"],
+                "content": [{"type": "text", "text": item["text"]}],
+            })
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": user_input}],
+        })
+        return messages
