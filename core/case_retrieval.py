@@ -1,70 +1,121 @@
 """
-类案检索核心模块
+相似案例匹配引擎
+Case Retrieval Engine
 """
+from typing import List, Dict, Any, Optional
 from utils.deli_client import DeliClient
-from utils.hunyuan_client import HunyuanClient
 
 
 class CaseRetrievalEngine:
-    """类案检索引擎"""
+    """相似案例智能检索与分析引擎"""
 
-    def __init__(self):
-        self.deli = DeliClient()
-        self.hunyuan = HunyuanClient()
+    def __init__(self, deli_client: DeliClient):
+        self.client = deli_client
 
-    def search_and_analyze(self, query: str, page_size: int = 5) -> dict:
+    def search(
+        self,
+        keywords: Optional[List[str]] = None,
+        long_text: Optional[str] = None,
+        page_no: int = 1,
+        page_size: int = 5,
+        court_level: Optional[List[str]] = None,
+        case_year_start: Optional[str] = None,
+        case_year_end: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        检索类案并生成分析报告
-        :param query: 用户查询文本
-        :param page_size: 返回案例数量
+        检索类似案例
+
+        Args:
+            keywords: 关键词列表（关键词检索模式）
+            long_text: 案情描述（语义检索模式，优先级高于 keywords）
+            page_no: 页码
+            page_size: 每页数量
+            court_level: 法院层级过滤
+            case_year_start: 裁判年份区间起始
+            case_year_end: 裁判年份区间截止
+
+        Returns:
+            包含 cases 列表和 total 数量的字典
         """
-        # 1. 调用得理 API 检索类案
-        result = self.deli.search_cases(
-            keywords=[query],
+        raw = self.client.search_cases(
+            keyword_arr=keywords if not long_text else None,
+            long_text=long_text,
+            page_no=page_no,
             page_size=page_size,
-            sort_field="correlation"
+            court_level_arr=court_level,
+            case_year_start=case_year_start,
+            case_year_end=case_year_end,
         )
 
-        cases = result.get("body", {}).get("data", [])
-        if not cases:
-            return {
-                "query": query,
-                "cases": [],
-                "analysis": "暂未检索到相关案例，请调整关键词后重试。"
-            }
-
-        # 2. 调用混元大模型生成类案分析报告
-        case_text = self._format_cases(cases)
-        prompt = f"""
-        #用户输入的问题：{query}
-        #检索出的类案列表：{case_text}
-        
-        你是一名经验丰富的律师，擅长基于用户输入问题检索出的类案（即与用户问题高度相关的相似案例）进行分析，
-        并生成一份结构清晰、内容详实的类案检索报告。
-        
-        要求：
-        1. 报告整体结构须采用"总分总"结构：先概述，再分述类案要点，最后总结归纳。
-        2. 仅可使用通过用户问题检索得出的类案列表中的案例，严禁引用类案列表之外的任何案例。
-        3. 每个案例须包含：案件名称、裁判法院、裁判时间、核心争议、裁判要旨。
-        """
-        analysis = self.hunyuan.chat(prompt)
-        analysis_text = self.hunyuan.extract_content(analysis)
-
+        cases = self._parse_cases(raw)
         return {
-            "query": query,
-            "total": result.get("body", {}).get("total", 0),
+            "total": raw.get("body", {}).get("total", 0),
+            "page_no": page_no,
+            "page_size": page_size,
             "cases": cases,
-            "analysis": analysis_text
         }
 
-    def _format_cases(self, cases: list) -> str:
-        """格式化案例列表为文本"""
-        formatted = []
+    def _parse_cases(self, raw: Dict) -> List[Dict]:
+        """解析案例列表，提取关键信息"""
+        data = raw.get("body", {}).get("data", [])
+        if not data:
+            return []
+
+        parsed = []
+        for item in data:
+            parsed.append({
+                "id": item.get("id", ""),
+                "title": item.get("title", ""),
+                "court": item.get("courtName", ""),
+                "court_level": item.get("courtLevel", ""),
+                "judgement_date": item.get("judgementDate", ""),
+                "case_number": item.get("caseNo", ""),
+                "case_type": item.get("caseType", ""),
+                "cause": item.get("cause", ""),
+                "summary": item.get("summary", ""),
+                "keywords": item.get("keywords", []),
+                "score": item.get("score", 0),
+            })
+        return parsed
+
+    def generate_report(self, query: str, cases: List[Dict]) -> str:
+        """
+        基于检索结果生成类案分析报告（模板）
+
+        Args:
+            query: 用户查询
+            cases: 类案列表
+
+        Returns:
+            Markdown格式分析报告
+        """
+        if not cases:
+            return "未检索到相关类案，建议调整检索关键词。"
+
+        lines = [
+            f"## 类案检索报告",
+            f"",
+            f"**检索问题**：{query}",
+            f"**检索结果**：共找到 {len(cases)} 个相关案例",
+            f"",
+            f"---",
+            f"",
+        ]
+
         for i, case in enumerate(cases, 1):
-            formatted.append(
-                f"{i}. 案件名称：{case.get('caseName', '未知')}\n"
-                f"   法院：{case.get('courtName', '未知')}\n"
-                f"   裁判时间：{case.get('judgeDate', '未知')}\n"
-                f"   摘要：{case.get('abstract', '暂无摘要')}"
-            )
-        return "\n\n".join(formatted)
+            lines.extend([
+                f"### 案例 {i}：{case.get('title', '未知案例')}",
+                f"",
+                f"- **法院**：{case.get('court', '-')}（{case.get('court_level', '-')}）",
+                f"- **案号**：{case.get('case_number', '-')}",
+                f"- **裁判日期**：{case.get('judgement_date', '-')}",
+                f"- **案由**：{case.get('cause', '-')}",
+                f"",
+                f"**裁判摘要**：",
+                f"{case.get('summary', '暂无摘要')}",
+                f"",
+                f"---",
+                f"",
+            ])
+
+        return "\n".join(lines)
