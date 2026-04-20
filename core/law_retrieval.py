@@ -1,93 +1,99 @@
 """
-法规检索核心模块
+精准法条检索引擎
+Law Retrieval Engine
 """
+from typing import List, Dict, Any, Optional
 from utils.deli_client import DeliClient
-from utils.hunyuan_client import HunyuanClient
 
 
 class LawRetrievalEngine:
-    """法规检索引擎"""
+    """法条精准检索引擎，支持关键词和语义双模式"""
 
-    def __init__(self):
-        self.deli = DeliClient()
-        self.hunyuan = HunyuanClient()
+    def __init__(self, deli_client: DeliClient):
+        self.client = deli_client
 
-    def search_and_analyze(
+    def search(
         self,
-        query: str,
+        keywords: List[str],
         field_name: str = "semantic",
+        page_no: int = 1,
         page_size: int = 5,
-        with_detail: bool = True
-    ) -> dict:
+        fetch_detail: bool = False,
+    ) -> Dict[str, Any]:
         """
-        检索法规并生成分析报告
-        :param query: 用户查询文本
-        :param field_name: 检索模式 semantic|title
-        :param page_size: 返回法规数量
-        :param with_detail: 是否获取法规全文
+        检索相关法规
+
+        Args:
+            keywords: 检索关键词或问题描述
+            field_name: 检索模式 "semantic"（语义）| "title"（关键词）
+            page_no: 页码
+            page_size: 每页数量
+            fetch_detail: 是否获取法规全文（会产生额外API调用）
+
+        Returns:
+            法规检索结果
         """
-        # 1. 法规列表检索
-        result = self.deli.search_laws(
-            keywords=[query],
+        raw = self.client.search_laws(
+            keywords=keywords,
             field_name=field_name,
-            page_size=page_size
+            page_no=page_no,
+            page_size=page_size,
         )
-        laws = result.get("body", {}).get("data", [])
-        if not laws:
-            return {
-                "query": query,
-                "laws": [],
-                "analysis": "暂未检索到相关法规，请调整关键词后重试。"
-            }
 
-        # 2. 可选：获取法规全文
-        if with_detail:
-            laws_with_detail = self.deli.get_laws_detail_batch(laws)
-        else:
-            laws_with_detail = laws
+        laws = self._parse_laws(raw)
 
-        # 3. 调用大模型生成法规分析
-        law_text = self._format_laws(laws_with_detail, with_detail)
-        prompt = f"""
-        用户问题：{query}
-        
-        相关法规内容：
-        {law_text}
-        
-        请以专业律师视角，对上述法规进行分析解读：
-        1. 简要说明各法规与用户问题的关联性
-        2. 提炼核心法律要点
-        3. 给出实操建议
-        
-        要求：语言专业准确，条理清晰，仅基于检索结果作答。
-        """
-        analysis = self.hunyuan.chat(prompt)
-        analysis_text = self.hunyuan.extract_content(analysis)
+        if fetch_detail and laws:
+            laws = self._enrich_with_detail(laws)
 
         return {
-            "query": query,
-            "total": result.get("body", {}).get("total", 0),
-            "laws": laws_with_detail,
-            "analysis": analysis_text
+            "total": raw.get("body", {}).get("total", 0),
+            "page_no": page_no,
+            "page_size": page_size,
+            "laws": laws,
         }
 
-    def _format_laws(self, laws: list, with_detail: bool = False) -> str:
-        """格式化法规列表为文本"""
-        formatted = []
-        for i, law in enumerate(laws, 1):
-            if with_detail and "body" in law:
-                body = law["body"].get("body", {})
-                content = body.get("lawDetailContent", "")[:2000]
-                formatted.append(
-                    f"{i}. 《{body.get('title', '未知法规')}》\n"
-                    f"   发布机构：{body.get('publisherName', '未知')}\n"
-                    f"   发布时间：{body.get('publishDate', '未知')}\n"
-                    f"   时效状态：{body.get('timelinessName', '未知')}\n"
-                    f"   内容摘录：{content}..."
-                )
-            else:
-                formatted.append(
-                    f"{i}. {law.get('title', '未知法规')}\n"
-                    f"   发布时间：{law.get('publishDate', '未知')}"
-                )
-        return "\n\n".join(formatted)
+    def get_detail(self, law_id: str) -> Dict[str, Any]:
+        """获取法规全文详情"""
+        raw = self.client.get_law_detail(law_id)
+        body = raw.get("body", {})
+        return {
+            "id": law_id,
+            "title": body.get("title", ""),
+            "publisher": body.get("publisherName", ""),
+            "publish_date": body.get("publishDate", ""),
+            "active_date": body.get("activeDate", ""),
+            "level": body.get("levelName", ""),
+            "timeliness": body.get("timelinessName", ""),
+            "content": body.get("lawDetailContent", ""),
+        }
+
+    def _parse_laws(self, raw: Dict) -> List[Dict]:
+        """解析法规列表"""
+        data = raw.get("body", {}).get("data", [])
+        if not data:
+            return []
+
+        return [
+            {
+                "id": item.get("id", ""),
+                "title": item.get("title", ""),
+                "publisher": item.get("publisherName", ""),
+                "publish_date": item.get("publishDate", ""),
+                "level": item.get("levelName", ""),
+                "timeliness": item.get("timelinessName", ""),
+                "score": item.get("score", 0),
+            }
+            for item in data
+        ]
+
+    def _enrich_with_detail(self, laws: List[Dict]) -> List[Dict]:
+        """批量补充法规全文"""
+        enriched = []
+        for law in laws:
+            try:
+                detail = self.get_detail(law["id"])
+                law["content"] = detail.get("content", "")
+            except Exception:
+                law["content"] = ""
+            enriched.append(law)
+        return enriched
